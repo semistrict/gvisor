@@ -36,6 +36,7 @@ type connectionlessEndpoint struct {
 	baseEndpoint
 	closerStack    [32]uintptr
 	closerStackLen int
+	closerStackStr string
 }
 
 var (

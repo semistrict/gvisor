@@ -14,9 +14,63 @@
 
 package transport
 
-import "context"
+import (
+	"context"
+	"fmt"
+	"regexp"
+	"runtime"
+	"strconv"
+	"strings"
+
+	"gvisor.dev/gvisor/pkg/log"
+)
+
+// beforeSave is invoked by stateify.
+func (e *connectionlessEndpoint) beforeSave() {
+	frames := runtime.CallersFrames(e.closerStack[:e.closerStackLen])
+	var b strings.Builder
+	for {
+		frame, more := frames.Next()
+		fmt.Fprintf(&b, "%s\n\t%s:%d pc=%#x\n", frame.Function, frame.File, frame.Line, frame.PC)
+		if !more {
+			break
+		}
+	}
+	e.closerStackStr = b.String()
+}
 
 // afterLoad is invoked by stateify.
 func (e *connectionlessEndpoint) afterLoad(context.Context) {
 	e.ops.InitHandler(e, &stackHandler{}, getSendBufferLimits, getReceiveBufferLimits)
+	if len(e.closerStackStr) == 0 {
+		return
+	}
+
+	var (
+		closerStack    [32]uintptr
+		closerStackLen int
+	)
+	pcRegex := regexp.MustCompile(`pc=0x([0-9a-fA-F]+)`)
+	lines := strings.Split(e.closerStackStr, "\n")
+	for _, line := range lines {
+		matches := pcRegex.FindStringSubmatch(line)
+		if len(matches) == 2 {
+			hexPC := matches[1]
+			pc, err := strconv.ParseUint(hexPC, 16, 64)
+			if err != nil {
+				log.Debugf("failed to parse hex PC %q: %v", hexPC, err)
+				break
+			}
+
+			if closerStackLen < len(closerStack) {
+				closerStack[closerStackLen] = uintptr(pc)
+				closerStackLen++
+			} else {
+				log.Debugf("symbolized stack contains more than 32 frames; truncating to 32.")
+				break
+			}
+		}
+	}
+	e.closerStack = closerStack
+	e.closerStackLen = closerStackLen
 }
