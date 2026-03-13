@@ -119,6 +119,53 @@ func (p *Pid) Load() int {
 	return int(p.val.Load())
 }
 
+func ProcessState(pid int) (string, error) {
+	if pid <= 0 {
+		return "", nil
+	}
+	data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "status"))
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if !strings.HasPrefix(line, "State:") {
+			continue
+		}
+		state := strings.TrimSpace(strings.TrimPrefix(line, "State:"))
+		if state == "" {
+			return "", fmt.Errorf("empty process state for pid %d", pid)
+		}
+		return state, nil
+	}
+	return "", fmt.Errorf("missing process state for pid %d", pid)
+}
+
+// ProcessRunning reports whether pid is still running. Zombies are treated as
+// stopped because they will never service control RPCs and should not block
+// teardown waits.
+func ProcessRunning(pid int) (bool, string, error) {
+	if pid <= 0 {
+		return false, "", nil
+	}
+	if err := unix.Kill(pid, 0); err != nil {
+		if errors.Is(err, unix.ESRCH) {
+			return false, "", nil
+		}
+		return false, "", err
+	}
+	state, err := ProcessState(pid)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, "", nil
+		}
+		return true, "", err
+	}
+	if strings.HasPrefix(state, "Z") {
+		return false, state, nil
+	}
+	return true, state, nil
+}
+
 // UnmarshalJSON implements json.Unmarshaler.UnmarshalJSON.
 func (p *Pid) UnmarshalJSON(b []byte) error {
 	var pid int
@@ -1436,15 +1483,13 @@ func (s *Sandbox) IsRootContainer(cid string) bool {
 // Destroy frees all resources associated with the sandbox. It fails fast and
 // is idempotent.
 func (s *Sandbox) destroy() error {
-	log.Debugf("Destroying sandbox %q", s.ID)
-	// Only delete the control file if it exists.
 	controlSocketPath := s.getControlSocketPath()
-	if len(controlSocketPath) > 0 {
-		if err := os.Remove(controlSocketPath); err != nil {
-			log.Warningf("failed to delete control socket file %q: %v", controlSocketPath, err)
-		}
-	}
 	pid := s.Pid.Load()
+	running, state, stateErr := ProcessRunning(pid)
+	if stateErr != nil {
+		log.Warningf("failed to read sandbox %q process state before destroy: pid=%d err=%v", s.ID, pid, stateErr)
+	}
+	log.Infof("Destroying sandbox %q, pid=%d, running=%t, state=%q, controlSocketPath=%q", s.ID, pid, running, state, controlSocketPath)
 	if pid != 0 {
 		log.Debugf("Killing sandbox %q", s.ID)
 		if err := unix.Kill(pid, unix.SIGKILL); err != nil && err != unix.ESRCH {
@@ -1452,6 +1497,11 @@ func (s *Sandbox) destroy() error {
 		}
 		if err := s.waitForStopped(); err != nil {
 			return fmt.Errorf("waiting sandbox %q stop: %w", s.ID, err)
+		}
+	}
+	if len(controlSocketPath) > 0 {
+		if err := os.Remove(controlSocketPath); err != nil && !os.IsNotExist(err) {
+			log.Warningf("failed to delete control socket file %q: %v", controlSocketPath, err)
 		}
 	}
 
@@ -1690,9 +1740,15 @@ func (s *Sandbox) IsRunning() bool {
 	if pid == 0 {
 		return false
 	}
-	// Send a signal 0 to the sandbox process. If it succeeds, the sandbox
-	// process is running.
-	return unix.Kill(pid, 0) == nil
+	running, state, err := ProcessRunning(pid)
+	if err != nil {
+		log.Warningf("failed to determine sandbox %q process state: pid=%d err=%v", s.ID, pid, err)
+		return true
+	}
+	if !running && strings.HasPrefix(state, "Z") {
+		log.Infof("Treating sandbox %q zombie process as stopped: pid=%d state=%q", s.ID, pid, state)
+	}
+	return running
 }
 
 // Stacks collects and returns all stacks for the sandbox.
@@ -1816,8 +1872,18 @@ func (s *Sandbox) waitForStopped() error {
 	defer cancel()
 	b := backoff.WithContext(backoff.NewConstantBackOff(100*time.Millisecond), ctx)
 	op := func() error {
-		if s.IsRunning() {
+		pid := s.Pid.Load()
+		running, state, err := ProcessRunning(pid)
+		if err != nil {
+			log.Warningf("failed to read sandbox %q process state while waiting for stop: pid=%d err=%v", s.ID, pid, err)
+			return fmt.Errorf("checking sandbox process state: %w", err)
+		}
+		if running {
+			log.Debugf("Sandbox %q still running while waiting for stop: pid=%d state=%q", s.ID, pid, state)
 			return fmt.Errorf("sandbox is still running")
+		}
+		if strings.HasPrefix(state, "Z") {
+			log.Infof("Sandbox %q process is zombie; treating as stopped: pid=%d state=%q", s.ID, pid, state)
 		}
 		return nil
 	}

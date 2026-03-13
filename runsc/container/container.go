@@ -1257,8 +1257,17 @@ func (c *Container) waitForStopped() error {
 	defer cancel()
 	b := backoff.WithContext(backoff.NewConstantBackOff(100*time.Millisecond), ctx)
 	op := func() error {
-		if err := unix.Kill(goferPid, 0); err == nil {
+		running, state, err := sandbox.ProcessRunning(int(goferPid))
+		if err != nil {
+			log.Warningf("failed to read gofer process state while waiting for stop: pid=%d err=%v", goferPid, err)
+			return fmt.Errorf("checking gofer process state: %w", err)
+		}
+		if running {
+			log.Debugf("Gofer still running while waiting for stop: cid=%s pid=%d state=%q", c.ID, goferPid, state)
 			return fmt.Errorf("gofer is still running")
+		}
+		if strings.HasPrefix(state, "Z") {
+			log.Infof("Treating gofer zombie process as stopped: cid=%s pid=%d state=%q", c.ID, goferPid, state)
 		}
 		c.GoferPid.Store(0)
 		return nil
