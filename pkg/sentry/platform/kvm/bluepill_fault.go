@@ -25,14 +25,13 @@ import (
 var (
 	// faultBlockSize is the size used for servicing memory faults.
 	//
-	// This should be large enough so that the total number of slots
-	// required to cover the 47-bit virtual address space does not exceed
-	// the KVM slot limit (e.g. 32764). Linux doesn't allocate virtual
-	// address space above 47-bit by default.
-	// It must be small enough to limit the memory overhead associated with
-	// KVM slot allocation. For example, using a 46-bit address space
-	// results in an overhead of ~250 MB.
-	faultBlockSize = uintptr(8 << 30)
+	// This should be large enough to avoid frequent faults and avoid
+	// using all available KVM slots, but small enough that KVM does not
+	// reject individual regions. Upstream changed this to 8GB for 47-bit
+	// address spaces, but that causes "out of slots" failures on
+	// Cloudflare's firecracker VMs due to fragmented physical regions.
+	// 2GB keeps slot usage well within limits.
+	faultBlockSize = uintptr(2 << 30)
 
 	// faultBlockMask is the mask for the fault blocks.
 	//
